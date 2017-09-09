@@ -72,12 +72,14 @@ def preprocess_lab(lab):
         # L_chan: black and white with input range [0, 100]
         # a_chan/b_chan: color channels with input range ~[-110, 110], not exact
         # [0, 100] => [-1, 1],  ~[-110, 110] => [-1, 1]
-        return [L_chan / 50 - 1, a_chan / 110, b_chan / 110]
+        return tf.stack([L_chan / 50 - 1, a_chan / 110, b_chan / 110], axis=2)
+        # return np.asarray([L_chan / 50 - 1, a_chan / 110, b_chan / 110])
 
 
-def deprocess_lab(L_chan, a_chan, b_chan):
+def deprocess_lab(lab):
     with tf.name_scope("deprocess_lab"):
         # this is axis=3 instead of axis=2 because we process individual images but deprocess batches
+        L_chan, a_chan, b_chan = tf.unstack(lab, axis=3)
         return tf.stack([(L_chan + 1) / 2 * 100, a_chan * 110, b_chan * 110], axis=3)
 
 
@@ -97,6 +99,16 @@ def conv(batch_input, out_channels, stride):
         # [batch, in_height, in_width, in_channels], [filter_width, filter_height, in_channels, out_channels]
         #     => [batch, out_height, out_width, out_channels]
         padded_input = tf.pad(batch_input, [[0, 0], [1, 1], [1, 1], [0, 0]], mode="CONSTANT")
+        conv = tf.nn.conv2d(padded_input, filter, [1, stride, stride, 1], padding="VALID")
+        return conv
+
+def conv_pointwise(batch_input, out_channels, stride=1):
+    with tf.variable_scope("conv_pointwise"):
+        in_channels = batch_input.get_shape()[3]
+        filter = tf.get_variable("filter", [1, 1, in_channels, out_channels], dtype=tf.float32, initializer=tf.random_normal_initializer(0, 0.02))
+        # [batch, in_height, in_width, in_channels], [filter_width, filter_height, in_channels, out_channels]
+        #     => [batch, out_height, out_width, out_channels]
+        padded_input = tf.pad(batch_input, [[0, 0], [0, 0], [0, 0], [0, 0]], mode="CONSTANT")
         conv = tf.nn.conv2d(padded_input, filter, [1, stride, stride, 1], padding="VALID")
         return conv
 
@@ -281,8 +293,14 @@ def load_examples():
         else:
             # break apart image pair and move to range [-1, 1]
             width = tf.shape(raw_input)[1] # [height, width, channels]
-            a_images = preprocess(raw_input[:,:width//2,:])
-            b_images = preprocess(raw_input[:,width//2:,:])
+            # a_images = preprocess(raw_input[:,:width//2,:])
+            # b_images = preprocess(raw_input[:,width//2:,:])
+            a_images = rgb_to_lab(raw_input[:,:width//2,:])
+            print (a_images.shape)
+            b_images = rgb_to_lab(raw_input[:,width//2:,:])
+            a_images = preprocess_lab(a_images)
+            print (a_images.shape)
+            b_images = preprocess_lab(b_images)
 
     if a.which_direction == "AtoB":
         inputs, targets = [a_images, b_images]
@@ -330,66 +348,54 @@ def load_examples():
 
 def create_generator(generator_inputs, generator_outputs_channels):
     layers = []
+    global_layers = []
 
     # encoder_1: [batch, 256, 256, in_channels] => [batch, 128, 128, ngf]
-    with tf.variable_scope("encoder_1"):
+    with tf.variable_scope("global_net_conv1"):
         output = conv(generator_inputs, a.ngf, stride=2)
-        layers.append(output)
+        global_layers.append(output)
 
     layer_specs = [
-        a.ngf * 2, # encoder_2: [batch, 128, 128, ngf] => [batch, 64, 64, ngf * 2]
-        a.ngf * 4, # encoder_3: [batch, 64, 64, ngf * 2] => [batch, 32, 32, ngf * 4]
-        a.ngf * 8, # encoder_4: [batch, 32, 32, ngf * 4] => [batch, 16, 16, ngf * 8]
-        a.ngf * 8, # encoder_5: [batch, 16, 16, ngf * 8] => [batch, 8, 8, ngf * 8]
-        a.ngf * 8, # encoder_6: [batch, 8, 8, ngf * 8] => [batch, 4, 4, ngf * 8]
-        a.ngf * 8, # encoder_7: [batch, 4, 4, ngf * 8] => [batch, 2, 2, ngf * 8]
-        a.ngf * 8, # encoder_8: [batch, 2, 2, ngf * 8] => [batch, 1, 1, ngf * 8]
+        a.ngf * 1, # encoder_2: [batch, 128, 128, ngf] => [batch, 64, 64, ngf * 2]
+        a.ngf * 1, # encoder_3: [batch, 64, 64, ngf * 2] => [batch, 32, 32, ngf * 4]
+        a.ngf * 1, # encoder_4: [batch, 32, 32, ngf * 4] => [batch, 16, 16, ngf * 8]
+        a.ngf * 2, # encoder_5: [batch, 16, 16, ngf * 8] => [batch, 8, 8, ngf * 8]
+        a.ngf * 2, # encoder_6: [batch, 8, 8, ngf * 8] => [batch, 4, 4, ngf * 8]
+        a.ngf * 4, # encoder_7: [batch, 4, 4, ngf * 8] => [batch, 2, 2, ngf * 8]
+        a.ngf * 4, # encoder_8: [batch, 2, 2, ngf * 8] => [batch, 1, 1, ngf * 8]
     ]
 
     for out_channels in layer_specs:
-        with tf.variable_scope("encoder_%d" % (len(layers) + 1)):
-            rectified = lrelu(layers[-1], 0.2)
+        with tf.variable_scope("global_net_conv%d" % (len(global_layers) + 1)):
+            rectified = lrelu(global_layers[-1], 0.2)
             # [batch, in_height, in_width, in_channels] => [batch, in_height/2, in_width/2, out_channels]
             convolved = conv(rectified, out_channels, stride=2)
             output = batchnorm(convolved)
-            layers.append(output)
+            global_layers.append(output)
 
-    layer_specs = [
-        (a.ngf * 8, 0.5),   # decoder_8: [batch, 1, 1, ngf * 8] => [batch, 2, 2, ngf * 8 * 2]
-        (a.ngf * 8, 0.5),   # decoder_7: [batch, 2, 2, ngf * 8 * 2] => [batch, 4, 4, ngf * 8 * 2]
-        (a.ngf * 8, 0.5),   # decoder_6: [batch, 4, 4, ngf * 8 * 2] => [batch, 8, 8, ngf * 8 * 2]
-        (a.ngf * 8, 0.0),   # decoder_5: [batch, 8, 8, ngf * 8 * 2] => [batch, 16, 16, ngf * 8 * 2]
-        (a.ngf * 4, 0.0),   # decoder_4: [batch, 16, 16, ngf * 8 * 2] => [batch, 32, 32, ngf * 4 * 2]
-        (a.ngf * 2, 0.0),   # decoder_3: [batch, 32, 32, ngf * 4 * 2] => [batch, 64, 64, ngf * 2 * 2]
-        (a.ngf, 0.0),       # decoder_2: [batch, 64, 64, ngf * 2 * 2] => [batch, 128, 128, ngf * 2]
-    ]
+    with tf.variable_scope("color_transfer_conv1"):
+        output = conv_pointwise(generator_inputs, a.ngf)
+        layers.append(output)
 
-    num_encoder_layers = len(layers)
-    for decoder_layer, (out_channels, dropout) in enumerate(layer_specs):
-        skip_layer = num_encoder_layers - decoder_layer - 1
-        with tf.variable_scope("decoder_%d" % (skip_layer + 1)):
-            if decoder_layer == 0:
-                # first decoder layer doesn't have skip connections
-                # since it is directly connected to the skip_layer
-                input = layers[-1]
-            else:
-                input = tf.concat([layers[-1], layers[skip_layer]], axis=3)
+    with tf.variable_scope("color_transfer_conv2"):
 
-            rectified = tf.nn.relu(input)
-            # [batch, in_height, in_width, in_channels] => [batch, in_height*2, in_width*2, out_channels]
-            output = deconv(rectified, out_channels)
-            output = batchnorm(output)
+        input = tf.nn.relu(layers[-1])
+        output = conv_pointwise(input, a.ngf*2)
+        output = batchnorm(output)
+        layers.append(output)
 
-            if dropout > 0.0:
-                output = tf.nn.dropout(output, keep_prob=1 - dropout)
+    with tf.variable_scope("color_transfer_conv3"):
 
-            layers.append(output)
+        input = tf.nn.relu(layers[-1])
+        output = conv_pointwise(input, a.ngf*4)
+        output = batchnorm(output)
+        layers.append(output)
 
-    # decoder_1: [batch, 128, 128, ngf * 2] => [batch, 256, 256, generator_outputs_channels]
-    with tf.variable_scope("decoder_1"):
-        input = tf.concat([layers[-1], layers[0]], axis=3)
-        rectified = tf.nn.relu(input)
-        output = deconv(rectified, generator_outputs_channels)
+    with tf.variable_scope("color_transfer_conv4"):
+
+        input = tf.nn.relu(layers[-1])
+        input_global = tf.nn.relu(global_layers[-1])
+        output = conv_pointwise(input + input_global, generator_outputs_channels)
         output = tf.tanh(output)
         layers.append(output)
 
@@ -402,7 +408,8 @@ def create_model(inputs, targets):
         layers = []
 
         # 2x [batch, height, width, in_channels] => [batch, height, width, in_channels * 2]
-        input = tf.concat([discrim_inputs, discrim_targets], axis=3)
+        # input = tf.concat([discrim_inputs, discrim_targets], axis=3)
+        input = discrim_targets
 
         # layer_1: [batch, 256, 256, in_channels * 2] => [batch, 128, 128, ndf]
         with tf.variable_scope("layer_1"):
@@ -654,9 +661,12 @@ def main():
         else:
             raise Exception("invalid direction")
     else:
-        inputs = deprocess(examples.inputs)
-        targets = deprocess(examples.targets)
-        outputs = deprocess(model.outputs)
+        # inputs = deprocess(examples.inputs)
+        # targets = deprocess(examples.targets)
+        # outputs = deprocess(model.outputs)
+        inputs = lab_to_rgb(deprocess_lab(examples.inputs))
+        targets = lab_to_rgb(deprocess_lab(examples.targets))
+        outputs = lab_to_rgb(deprocess_lab(model.outputs))
 
     def convert(image):
         if a.aspect_ratio != 1.0:
